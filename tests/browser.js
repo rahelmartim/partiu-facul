@@ -154,9 +154,13 @@ export async function launchChrome(chromePath) {
     "--force-prefers-reduced-motion",
     "--remote-debugging-port=0",
     `--user-data-dir=${profile}`,
-    ...(process.platform === "linux" ? ["--no-sandbox"] : []),
+    ...(process.platform === "linux" ? ["--no-sandbox", "--disable-dev-shm-usage"] : []),
     "about:blank",
-  ]);
+  ], {
+    // Its own process group, so that close() can end the helper processes too.
+    detached: process.platform !== "win32",
+    stdio: ["ignore", "ignore", "pipe"],
+  });
   const port = await new Promise((done, reject) => {
     let output = "";
     const timer = setTimeout(() => reject(new Error(`Chrome did not start:\n${output}`)), 20000);
@@ -168,7 +172,22 @@ export async function launchChrome(chromePath) {
         done(match[1]);
       }
     });
+  }).catch((error) => {
+    stop();
+    throw error;
   });
+  // Node.js must not wait for Chrome or its output to end.
+  chrome.unref();
+  chrome.stderr.unref?.();
+
+  function stop() {
+    try {
+      if (process.platform === "win32") chrome.kill();
+      else process.kill(-chrome.pid, "SIGKILL");
+    } catch {
+      // Chrome already ended.
+    }
+  }
 
   return {
     async newPage({ width = 1100, height = 900, mobile = false } = {}) {
@@ -185,10 +204,20 @@ export async function launchChrome(chromePath) {
       return page;
     },
     async close() {
-      chrome.kill();
-      await new Promise((done) => (chrome.exitCode !== null ? done() : chrome.once("exit", done)));
-      // Chrome can still write to its profile for a moment after it exits.
-      rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+      stop();
+      await new Promise((done) => {
+        if (chrome.exitCode !== null || chrome.signalCode !== null) return done();
+        chrome.once("exit", done);
+        setTimeout(done, 3000).unref();
+      });
+      chrome.stderr.destroy();
+      // Helper processes can write to the profile for a moment longer, so the
+      // cleanup of the temporary folder is best effort.
+      try {
+        rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+      } catch {
+        // The operating system removes temporary folders later.
+      }
     },
   };
 }
